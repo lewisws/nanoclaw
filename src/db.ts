@@ -82,6 +82,20 @@ function createSchema(database: Database.Database): void {
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
     );
+
+    CREATE TABLE IF NOT EXISTS memory_task_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_type TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      status TEXT NOT NULL,
+      details TEXT,
+      error_message TEXT,
+      retry_count INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_memory_task_logs_status ON memory_task_logs(status);
+    CREATE INDEX IF NOT EXISTS idx_memory_task_logs_type ON memory_task_logs(task_type);
   `);
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -694,4 +708,110 @@ function migrateJsonState(): void {
       }
     }
   }
+}
+
+// --- Memory Task Log accessors ---
+
+export interface MemoryTaskLogRow {
+  id: number;
+  task_type: string;
+  group_folder: string;
+  started_at: string;
+  completed_at: string | null;
+  status: string;
+  details: string | null;
+  error_message: string | null;
+  retry_count: number;
+}
+
+export function createMemoryTaskLog(log: {
+  task_type: string;
+  group_folder: string;
+}): number {
+  const result = db
+    .prepare(
+      `INSERT INTO memory_task_logs (task_type, group_folder, started_at, status)
+       VALUES (?, ?, ?, 'running')`,
+    )
+    .run(log.task_type, log.group_folder, new Date().toISOString());
+  return result.lastInsertRowid as number;
+}
+
+export function updateMemoryTaskLog(
+  id: number,
+  updates: {
+    status?: string;
+    details?: string;
+    error_message?: string;
+    retry_count?: number;
+  },
+): void {
+  const fields: string[] = ['completed_at = ?'];
+  const values: unknown[] = [new Date().toISOString()];
+
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.details !== undefined) {
+    fields.push('details = ?');
+    values.push(updates.details);
+  }
+  if (updates.error_message !== undefined) {
+    fields.push('error_message = ?');
+    values.push(updates.error_message);
+  }
+  if (updates.retry_count !== undefined) {
+    fields.push('retry_count = ?');
+    values.push(updates.retry_count);
+  }
+
+  values.push(id);
+  db.prepare(
+    `UPDATE memory_task_logs SET ${fields.join(', ')} WHERE id = ?`,
+  ).run(...values);
+}
+
+export function getFailedMemoryTasks(): MemoryTaskLogRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM memory_task_logs
+       WHERE status = 'failed' AND retry_count < 3
+       ORDER BY started_at DESC`,
+    )
+    .all() as MemoryTaskLogRow[];
+}
+
+export function getMemoryTaskAlerts(): MemoryTaskLogRow[] {
+  return db
+    .prepare(
+      `SELECT * FROM memory_task_logs
+       WHERE status = 'failed' AND retry_count >= 3
+       ORDER BY started_at DESC
+       LIMIT 10`,
+    )
+    .all() as MemoryTaskLogRow[];
+}
+
+export function getRecentMemoryTaskLogs(
+  taskType?: string,
+  limit: number = 20,
+): MemoryTaskLogRow[] {
+  if (taskType) {
+    return db
+      .prepare(
+        `SELECT * FROM memory_task_logs
+         WHERE task_type = ?
+         ORDER BY started_at DESC
+         LIMIT ?`,
+      )
+      .all(taskType, limit) as MemoryTaskLogRow[];
+  }
+  return db
+    .prepare(
+      `SELECT * FROM memory_task_logs
+       ORDER BY started_at DESC
+       LIMIT ?`,
+    )
+    .all(limit) as MemoryTaskLogRow[];
 }

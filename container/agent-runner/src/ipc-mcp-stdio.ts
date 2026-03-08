@@ -14,6 +14,7 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const MEMORY_DIR = path.join(IPC_DIR, 'memory');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -329,6 +330,127 @@ Use available_groups.json to find the JID for a group. The folder name must be c
 
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
+    };
+  },
+);
+
+// ============ Memory Tools ============
+
+server.tool(
+  'memory_search',
+  `Search your memory for relevant information. Use this to recall past conversations, insights, and lessons learned.
+
+Scopes:
+- "all": Search everything (default)
+- "insights": Search only insights about the user
+- "lessons": Search only lessons learned
+- "logs": Search conversation history`,
+  {
+    query: z.string().describe('What to search for in memory'),
+    scope: z.enum(['all', 'insights', 'lessons', 'logs']).default('all').describe('Where to search'),
+    limit: z.number().optional().default(10).describe('Maximum results to return'),
+  },
+  async (args) => {
+    const data = {
+      type: 'memory_search',
+      query: args.query,
+      scope: args.scope || 'all',
+      limit: args.limit || 10,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    const filename = writeIpcFile(MEMORY_DIR, data);
+
+    // Wait for response file
+    const responseFile = path.join(MEMORY_DIR, `response-${filename}`);
+    const startTime = Date.now();
+    const timeout = 10000; // 10 seconds
+
+    while (Date.now() - startTime < timeout) {
+      if (fs.existsSync(responseFile)) {
+        const response = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+        fs.unlinkSync(responseFile);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(response, null, 2) }],
+        };
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: 'Memory search timed out. Please try again.' }],
+      isError: true,
+    };
+  },
+);
+
+server.tool(
+  'memory_save',
+  `Save important information to memory for future reference.
+
+Types:
+- "insight": Save an insight about the user (preferences, characteristics, patterns)
+- "lesson": Save a lesson learned (what worked, what didn't, best practices)
+
+Priority (AI will determine automatically if not specified):
+- "P0": Permanent - core user traits, long-term preferences
+- "P1": 30 days - temporary patterns, project-specific info`,
+  {
+    content: z.string().describe('The information to remember'),
+    type: z.enum(['insight', 'lesson']).describe('Type of memory'),
+    priority: z.enum(['P0', 'P1']).optional().describe('How long to keep (P0=permanent, P1=30 days). If omitted, AI determines automatically.'),
+  },
+  async (args) => {
+    const data = {
+      type: 'memory_save',
+      memoryContent: args.content,
+      memoryType: args.type,
+      priority: args.priority,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MEMORY_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Memory saved as ${args.type}${args.priority ? ` (${args.priority})` : ''}.` }],
+    };
+  },
+);
+
+server.tool(
+  'memory_stats',
+  'Get statistics about your memory system for this group.',
+  {},
+  async () => {
+    const data = {
+      type: 'memory_stats',
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    const filename = writeIpcFile(MEMORY_DIR, data);
+
+    // Wait for response file
+    const responseFile = path.join(MEMORY_DIR, `response-${filename}`);
+    const startTime = Date.now();
+    const timeout = 5000; // 5 seconds
+
+    while (Date.now() - startTime < timeout) {
+      if (fs.existsSync(responseFile)) {
+        const response = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+        fs.unlinkSync(responseFile);
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(response, null, 2) }],
+        };
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: 'Memory stats request timed out.' }],
+      isError: true,
     };
   },
 );

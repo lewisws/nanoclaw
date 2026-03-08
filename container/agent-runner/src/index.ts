@@ -398,6 +398,38 @@ async function runQuery(
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
+  // Load memory system L0 index for prompt injection
+  const memoryIndexPath = '/workspace/group/memory/.abstract';
+  let memoryPrompt = '';
+  try {
+    if (fs.existsSync(memoryIndexPath)) {
+      const YAML = await import('yaml');
+      const memoryIndex = YAML.parse(fs.readFileSync(memoryIndexPath, 'utf-8'));
+      if (memoryIndex?.stats) {
+        const lines = [
+          `\n[Memory System]`,
+          `- Insights: ${memoryIndex.stats.total_insights || 0}`,
+          `- Lessons: ${memoryIndex.stats.total_lessons || 0}`,
+          `- Active logs: ${memoryIndex.stats.active_logs || 0}`,
+        ];
+        if (memoryIndex.summary?.length > 0) {
+          lines.push(`\n[Key Memories]`);
+          for (const s of memoryIndex.summary) {
+            lines.push(`- ${s}`);
+          }
+        }
+        lines.push(`\nUse memory_search tool to query detailed memories.`);
+        memoryPrompt = lines.join('\n');
+        log(`Memory system loaded: ${memoryIndex.stats.total_insights} insights, ${memoryIndex.stats.total_lessons} lessons`);
+      }
+    }
+  } catch (err) {
+    log(`Warning: Failed to load memory index: ${err}`);
+  }
+
+  // Combine global CLAUDE.md with memory system info
+  const systemPromptAppend = [globalClaudeMd, memoryPrompt].filter(Boolean).join('\n\n') || undefined;
+
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
@@ -421,8 +453,8 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+      systemPrompt: systemPromptAppend
+        ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend }
         : undefined,
       allowedTools: [
         'Bash',

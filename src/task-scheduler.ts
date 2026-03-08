@@ -20,6 +20,19 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
+import {
+  JANITOR_CRON,
+  COMPOUNDING_CRON,
+} from './memory/constants.js';
+import {
+  runJanitorForAllGroups,
+} from './memory/janitor.js';
+import {
+  runCompoundingForAllGroups,
+} from './memory/compounding.js';
+import {
+  retryFailedTasks,
+} from './memory/supervisor.js';
 
 /**
  * Compute the next run time for a recurring task, anchored to the
@@ -238,6 +251,9 @@ async function runTask(
 }
 
 let schedulerRunning = false;
+let memoryTasksInitialized = false;
+let nextJanitorRun: Date | null = null;
+let nextCompoundingRun: Date | null = null;
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
   if (schedulerRunning) {
@@ -247,8 +263,14 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   schedulerRunning = true;
   logger.info('Scheduler loop started');
 
+  // 初始化记忆系统定时任务
+  initializeMemoryTasks();
+
   const loop = async () => {
     try {
+      // 检查并执行记忆系统任务
+      await checkAndRunMemoryTasks();
+
       const dueTasks = getDueTasks();
       if (dueTasks.length > 0) {
         logger.info({ count: dueTasks.length }, 'Found due tasks');
@@ -278,4 +300,86 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 /** @internal - for tests only. */
 export function _resetSchedulerLoopForTests(): void {
   schedulerRunning = false;
+  memoryTasksInitialized = false;
+  nextJanitorRun = null;
+  nextCompoundingRun = null;
+}
+
+/**
+ * 初始化记忆系统定时任务
+ */
+function initializeMemoryTasks(): void {
+  if (memoryTasksInitialized) return;
+  memoryTasksInitialized = true;
+
+  try {
+    // Janitor: 每日 00:00
+    const janitorInterval = CronExpressionParser.parse(JANITOR_CRON, { tz: TIMEZONE });
+    nextJanitorRun = janitorInterval.next().toDate();
+    if (nextJanitorRun) {
+      logger.info({ nextRun: nextJanitorRun.toISOString() }, 'Janitor task scheduled');
+    }
+
+    // Compounding: 每 3 天 08:00
+    const compoundingInterval = CronExpressionParser.parse(COMPOUNDING_CRON, { tz: TIMEZONE });
+    nextCompoundingRun = compoundingInterval.next().toDate();
+    if (nextCompoundingRun) {
+      logger.info({ nextRun: nextCompoundingRun.toISOString() }, 'Compounding task scheduled');
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to initialize memory tasks');
+  }
+}
+
+/**
+ * 检查并执行记忆系统任务
+ */
+async function checkAndRunMemoryTasks(): Promise<void> {
+  const now = new Date();
+
+  // 检查 Janitor
+  if (nextJanitorRun && now >= nextJanitorRun) {
+    logger.info('Running scheduled Janitor task');
+    try {
+      const results = runJanitorForAllGroups();
+      const totalArchived = results.reduce((sum, r) => sum + r.logs_archived, 0);
+      logger.info({ totalArchived }, 'Janitor task completed');
+    } catch (err) {
+      logger.error({ err }, 'Janitor task failed');
+    }
+
+    // 计算下次运行时间
+    const janitorInterval = CronExpressionParser.parse(JANITOR_CRON, { tz: TIMEZONE });
+    nextJanitorRun = janitorInterval.next().toDate();
+    if (nextJanitorRun) {
+      logger.debug({ nextRun: nextJanitorRun.toISOString() }, 'Next Janitor run scheduled');
+    }
+  }
+
+  // 检查 Compounding
+  if (nextCompoundingRun && now >= nextCompoundingRun) {
+    logger.info('Running scheduled Compounding task');
+    try {
+      const results = await runCompoundingForAllGroups();
+      const totalInsights = results.reduce((sum, r) => sum + r.insights_generated, 0);
+      const totalLessons = results.reduce((sum, r) => sum + r.lessons_generated, 0);
+      logger.info({ totalInsights, totalLessons }, 'Compounding task completed');
+    } catch (err) {
+      logger.error({ err }, 'Compounding task failed');
+    }
+
+    // 计算下次运行时间
+    const compoundingInterval = CronExpressionParser.parse(COMPOUNDING_CRON, { tz: TIMEZONE });
+    nextCompoundingRun = compoundingInterval.next().toDate();
+    if (nextCompoundingRun) {
+      logger.debug({ nextRun: nextCompoundingRun.toISOString() }, 'Next Compounding run scheduled');
+    }
+  }
+
+  // 每次循环都尝试重试失败的任务
+  try {
+    await retryFailedTasks();
+  } catch (err) {
+    logger.error({ err }, 'Failed to retry memory tasks');
+  }
 }

@@ -9,6 +9,17 @@ import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
+import {
+  readL0Index,
+  saveInsight,
+  saveLesson,
+  searchInsights,
+  searchLessons,
+  searchLogs,
+  type InsightType,
+  type LessonType,
+  type Priority,
+} from './memory/index.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -143,6 +154,37 @@ export function startIpcWatcher(deps: IpcDeps): void {
         }
       } catch (err) {
         logger.error({ err, sourceGroup }, 'Error reading IPC tasks directory');
+      }
+
+      // Process memory requests from this group's IPC directory
+      const memoryDir = path.join(ipcBaseDir, sourceGroup, 'memory');
+      try {
+        if (fs.existsSync(memoryDir)) {
+          const memoryFiles = fs
+            .readdirSync(memoryDir)
+            .filter((f) => f.endsWith('.json') && !f.startsWith('response-'));
+          for (const file of memoryFiles) {
+            const filePath = path.join(memoryDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              await processMemoryIpc(data, sourceGroup, memoryDir, file);
+              fs.unlinkSync(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC memory request',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              fs.mkdirSync(errorDir, { recursive: true });
+              fs.renameSync(
+                filePath,
+                path.join(errorDir, `${sourceGroup}-${file}`),
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.error({ err, sourceGroup }, 'Error reading IPC memory directory');
       }
     }
 
@@ -452,4 +494,126 @@ export async function processTaskIpc(
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
+}
+
+/**
+ * Process memory-related IPC requests
+ */
+async function processMemoryIpc(
+  data: {
+    type: string;
+    query?: string;
+    scope?: 'all' | 'insights' | 'lessons' | 'logs';
+    limit?: number;
+    memoryContent?: string;
+    memoryType?: 'insight' | 'lesson';
+    priority?: Priority;
+    groupFolder?: string;
+  },
+  sourceGroup: string,
+  memoryDir: string,
+  requestFile: string,
+): Promise<void> {
+  const groupFolder = data.groupFolder || sourceGroup;
+
+  switch (data.type) {
+    case 'memory_search': {
+      if (!data.query) {
+        writeMemoryResponse(memoryDir, requestFile, { error: 'Missing query' });
+        break;
+      }
+
+      const scope = data.scope || 'all';
+      const limit = data.limit || 10;
+      const results: {
+        insights: ReturnType<typeof searchInsights>;
+        lessons: ReturnType<typeof searchLessons>;
+        logs: ReturnType<typeof searchLogs>;
+      } = {
+        insights: [],
+        lessons: [],
+        logs: [],
+      };
+
+      if (scope === 'all' || scope === 'insights') {
+        results.insights = searchInsights(groupFolder, data.query).slice(0, limit);
+      }
+      if (scope === 'all' || scope === 'lessons') {
+        results.lessons = searchLessons(groupFolder, data.query).slice(0, limit);
+      }
+      if (scope === 'all' || scope === 'logs') {
+        results.logs = searchLogs(groupFolder, data.query).slice(0, limit);
+      }
+
+      writeMemoryResponse(memoryDir, requestFile, results);
+      logger.debug({ groupFolder, query: data.query, scope }, 'Memory search completed');
+      break;
+    }
+
+    case 'memory_save': {
+      if (!data.memoryContent || !data.memoryType) {
+        writeMemoryResponse(memoryDir, requestFile, { error: 'Missing content or type' });
+        break;
+      }
+
+      try {
+        if (data.memoryType === 'insight') {
+          saveInsight(groupFolder, {
+            priority: data.priority || 'P1',
+            type: 'phase' as InsightType,
+            content: data.memoryContent,
+            source: 'user_request',
+          });
+        } else {
+          saveLesson(groupFolder, {
+            priority: data.priority || 'P1',
+            type: 'pattern' as LessonType,
+            lesson: data.memoryContent,
+          });
+        }
+
+        writeMemoryResponse(memoryDir, requestFile, { success: true });
+        logger.debug({ groupFolder, type: data.memoryType }, 'Memory saved');
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        writeMemoryResponse(memoryDir, requestFile, { error: errorMessage });
+        logger.error({ err, groupFolder }, 'Failed to save memory');
+      }
+      break;
+    }
+
+    case 'memory_stats': {
+      try {
+        const index = readL0Index(groupFolder);
+        writeMemoryResponse(memoryDir, requestFile, {
+          stats: index.stats,
+          recent: index.recent,
+          summary: index.summary,
+        });
+        logger.debug({ groupFolder }, 'Memory stats retrieved');
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        writeMemoryResponse(memoryDir, requestFile, { error: errorMessage });
+        logger.error({ err, groupFolder }, 'Failed to get memory stats');
+      }
+      break;
+    }
+
+    default:
+      logger.warn({ type: data.type }, 'Unknown memory IPC type');
+  }
+}
+
+/**
+ * Write response file for memory IPC request
+ */
+function writeMemoryResponse(
+  memoryDir: string,
+  requestFile: string,
+  response: object,
+): void {
+  const responseFile = path.join(memoryDir, `response-${requestFile}`);
+  const tempPath = `${responseFile}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(response, null, 2));
+  fs.renameSync(tempPath, responseFile);
 }
